@@ -36,6 +36,11 @@ def using_bamboo_coordinator_mode() -> bool:
     return global_config_map.get("bamboo_relay_use_coordinator").value
 
 
+MIN_QUOTE_ORDER_AMOUNTS = [["BTC", 0.0011],
+                           ["ETH", 0.05],
+                           ["USD", 11],
+                           ["BNB", 0.5]]
+
 # Main global config store
 global_config_map = {
     # The variables below are usually not prompted during setup process
@@ -179,6 +184,21 @@ global_config_map = {
                   prompt="Enter your Bittrex secret key >>> ",
                   required_if=using_exchange("bittrex"),
                   is_secure=True),
+    "kucoin_api_key":
+        ConfigVar(key="kucoin_api_key",
+                  prompt="Enter your KuCoin API key >>> ",
+                  required_if=using_exchange("kucoin"),
+                  is_secure=True),
+    "kucoin_secret_key":
+        ConfigVar(key="kucoin_secret_key",
+                  prompt="Enter your KuCoin secret key >>> ",
+                  required_if=using_exchange("kucoin"),
+                  is_secure=True),
+    "kucoin_passphrase":
+        ConfigVar(key="kucoin_passphrase",
+                  prompt="Enter your KuCoin passphrase >>> ",
+                  required_if=using_exchange("kucoin"),
+                  is_secure=True),
     "bitcoin_com_api_key":
         ConfigVar(key="bitcoin_com_api_key",
                   prompt="Enter your bitcoin_com API key >>> ",
@@ -272,4 +292,11 @@ global_config_map = {
                   prompt="Would you like to send error logs to hummingbot? (Yes/No) >>> ",
                   type_str="bool",
                   default=True),
+    "min_quote_order_amount":
+        ConfigVar(key="min_quote_order_amount",
+                  prompt=None,
+                  required_if=lambda: False,
+                  type_str="json",
+                  default=MIN_QUOTE_ORDER_AMOUNTS,
+                  migration_default=MIN_QUOTE_ORDER_AMOUNTS),
 }

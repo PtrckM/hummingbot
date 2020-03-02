@@ -15,8 +15,8 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.logger.application_warning import ApplicationWarning
 from hummingbot.market.binance.binance_market import BinanceMarket
 from hummingbot.market.bittrex.bittrex_market import BittrexMarket
+from hummingbot.market.kucoin.kucoin_market import KucoinMarket
 from hummingbot.market.coinbase_pro.coinbase_pro_market import CoinbaseProMarket
-from hummingbot.market.ddex.ddex_market import DDEXMarket
 from hummingbot.market.huobi.huobi_market import HuobiMarket
 from hummingbot.market.liquid.liquid_market import LiquidMarket
 from hummingbot.market.market_base import MarketBase
@@ -55,13 +55,13 @@ MARKET_CLASSES = {
     "bamboo_relay": BambooRelayMarket,
     "binance": BinanceMarket,
     "coinbase_pro": CoinbaseProMarket,
-    "ddex": DDEXMarket,
     "huobi": HuobiMarket,
     "liquid": LiquidMarket,
     "idex": IDEXMarket,
     "radar_relay": RadarRelayMarket,
     "dolomite": DolomiteMarket,
     "bittrex": BittrexMarket,
+    "kucoin": KucoinMarket,
     "bitcoin_com": BitcoinComMarket
 }
 
@@ -236,16 +236,6 @@ class HummingbotApplication(*commands):
                 for asset, balance in paper_trade_account_balance:
                     market.set_balance(asset, balance)
 
-            elif market_name == "ddex":
-                assert self.wallet is not None
-                market = DDEXMarket(
-                    wallet=self.wallet,
-                    ethereum_rpc_url=ethereum_rpc_url,
-                    order_book_tracker_data_source_type=OrderBookTrackerDataSourceType.EXCHANGE_API,
-                    trading_pairs=trading_pairs,
-                    trading_required=self._trading_required,
-                )
-
             elif market_name == "idex":
                 assert self.wallet is not None
                 idex_api_key: str = global_config_map.get("idex_api_key").value
@@ -341,6 +331,16 @@ class HummingbotApplication(*commands):
                                        order_book_tracker_data_source_type=OrderBookTrackerDataSourceType.EXCHANGE_API,
                                        trading_pairs=trading_pairs,
                                        trading_required=self._trading_required)
+            elif market_name == "kucoin":
+                kucoin_api_key = global_config_map.get("kucoin_api_key").value
+                kucoin_secret_key = global_config_map.get("kucoin_secret_key").value
+                kucoin_passphrase = global_config_map.get("kucoin_passphrase").value
+                market = KucoinMarket(kucoin_api_key,
+                                      kucoin_passphrase,
+                                      kucoin_secret_key,
+                                      order_book_tracker_data_source_type=OrderBookTrackerDataSourceType.EXCHANGE_API,
+                                      trading_pairs=trading_pairs,
+                                      trading_required=self._trading_required)
             elif market_name == "bitcoin_com":
                 bitcoin_com_api_key = global_config_map.get("bitcoin_com_api_key").value
                 bitcoin_com_secret_key = global_config_map.get("bitcoin_com_secret_key").value
