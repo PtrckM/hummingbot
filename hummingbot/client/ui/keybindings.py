@@ -28,6 +28,16 @@ def load_key_bindings(hb) -> KeyBindings:
         hb.app.log("\n[Double CTRL + C] keyboard exit")
         safe_ensure_future(hb.exit_loop())
 
+    @bindings.add("c-x")
+    def stop_configuration(event):
+        hb.app.log("\n[CTRL + X] Exiting config...")
+        hb.app.to_stop_config = True
+        hb.app.pending_input = " "
+        hb.app.input_event.set()
+        hb.app.change_prompt(prompt=">>> ")
+        hb.placeholder_mode = False
+        hb.app.hide_input = False
+
     @bindings.add("c-s")
     def status(event):
         hb.app.log("\n[CTRL + S] Status")
@@ -82,5 +92,9 @@ def load_key_bindings(hb) -> KeyBindings:
         scroll_up(event, hb.app.output_field.window, hb.app.output_field.buffer)
         event.app.layout.current_window = hb.app.input_field.window
         event.app.layout.focus = hb.app.input_field.buffer
+
+    @bindings.add("escape")
+    def stop_live_update(event):
+        hb.app.live_updates = False
 
     return bindings

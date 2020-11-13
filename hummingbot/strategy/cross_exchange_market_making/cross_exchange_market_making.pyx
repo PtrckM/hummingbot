@@ -19,16 +19,13 @@ from hummingbot.core.event.events import TradeType
 from hummingbot.core.data_type.limit_order cimport LimitOrder
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.market.market_base cimport MarketBase
-from hummingbot.market.market_base import (
-    MarketBase,
-    OrderType
-)
+from hummingbot.connector.exchange_base import ExchangeBase
+from hummingbot.connector.exchange_base cimport ExchangeBase
+from hummingbot.core.event.events import OrderType
+
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.strategy.strategy_base cimport StrategyBase
 from hummingbot.strategy.strategy_base import StrategyBase
-from hummingbot.core.utils.exchange_rate_conversion import ExchangeRateConversion
-
 from .cross_exchange_market_pair import CrossExchangeMarketPair
 from .order_id_market_pair_tracker import OrderIDMarketPairTracker
 
@@ -75,7 +72,11 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                  cancel_order_threshold: Decimal = Decimal("0.05"),
                  top_depth_tolerance: Decimal = Decimal(0),
                  logging_options: int = OPTION_LOG_ALL,
-                 status_report_interval: float = 900):
+                 status_report_interval: float = 900,
+                 taker_to_maker_base_conversion_rate: Decimal = Decimal("1"),
+                 taker_to_maker_quote_conversion_rate: Decimal = Decimal("1"),
+                 hb_app_notification: bool = False
+                 ):
         """
         Initializes a cross exchange market making strategy object.
 
@@ -129,30 +130,34 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         self._last_timestamp = 0
         self._limit_order_min_expiration = limit_order_min_expiration
         self._status_report_interval = status_report_interval
-        self._exchange_rate_conversion = ExchangeRateConversion.get_instance()
         self._market_pair_tracker = OrderIDMarketPairTracker()
         self._adjust_orders_enabled = adjust_order_enabled
+        self._taker_to_maker_base_conversion_rate = taker_to_maker_base_conversion_rate
+        self._taker_to_maker_quote_conversion_rate = taker_to_maker_quote_conversion_rate
+        self._hb_app_notification = hb_app_notification
 
+        self._maker_order_ids = []
         cdef:
             list all_markets = list(self._maker_markets | self._taker_markets)
 
         self.c_add_markets(all_markets)
 
     @property
-    def active_maker_orders(self) -> List[Tuple[MarketBase, LimitOrder]]:
-        return self._sb_order_tracker.active_maker_orders
+    def active_limit_orders(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
+        return [(ex, order) for ex, order in self._sb_order_tracker.active_limit_orders
+                if order.client_order_id in self._maker_order_ids]
 
     @property
-    def cached_maker_orders(self) -> List[Tuple[MarketBase, LimitOrder]]:
-        return self._sb_order_tracker.shadow_maker_orders
+    def cached_limit_orders(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
+        return self._sb_order_tracker.shadow_limit_orders
 
     @property
-    def active_bids(self) -> List[Tuple[MarketBase, LimitOrder]]:
-        return [(market, limit_order) for market, limit_order in self.active_maker_orders if limit_order.is_buy]
+    def active_bids(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
+        return [(market, limit_order) for market, limit_order in self.active_limit_orders if limit_order.is_buy]
 
     @property
-    def active_asks(self) -> List[Tuple[MarketBase, LimitOrder]]:
-        return [(market, limit_order) for market, limit_order in self.active_maker_orders if not limit_order.is_buy]
+    def active_asks(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
+        return [(market, limit_order) for market, limit_order in self.active_limit_orders if not limit_order.is_buy]
 
     @property
     def logging_options(self) -> int:
@@ -162,10 +167,6 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
     def logging_options(self, int64_t logging_options):
         self._logging_options = logging_options
 
-    @property
-    def exchange_rate_conversion(self) -> ExchangeRateConversion:
-        return self._exchange_rate_conversion
-
     def format_status(self) -> str:
         cdef:
             list lines = []
@@ -174,7 +175,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             LimitOrder typed_limit_order
 
         # Go through the currently open limit orders, and group them by market pair.
-        for _, limit_order in self.active_maker_orders:
+        for _, limit_order in self.active_limit_orders:
             typed_limit_order = limit_order
             market_pair = self._market_pair_tracker.c_get_market_pair_from_order_id(typed_limit_order.client_order_id)
             if market_pair not in tracked_maker_orders:
@@ -196,7 +197,9 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             # See if there're any open orders.
             if market_pair in tracked_maker_orders and len(tracked_maker_orders[market_pair]) > 0:
                 limit_orders = list(tracked_maker_orders[market_pair].values())
-                df = LimitOrder.to_pandas(limit_orders)
+                bid, ask = self.c_get_top_bid_ask(market_pair)
+                mid_price = (bid + ask)/2
+                df = LimitOrder.to_pandas(limit_orders, mid_price)
                 df_lines = str(df).split("\n")
                 lines.extend(["", "  Active orders:"] +
                              ["    " + line for line in df_lines])
@@ -259,7 +262,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             int64_t last_tick = <int64_t>(self._last_timestamp // self._status_report_interval)
             bint should_report_warnings = ((current_tick > last_tick) and
                                            (self._logging_options & self.OPTION_LOG_STATUS_REPORT))
-            list active_maker_orders = self.active_maker_orders
+            list active_limit_orders = self.active_limit_orders
             LimitOrder limit_order
 
         try:
@@ -287,7 +290,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             # Calculate a mapping from market pair to list of active limit orders on the market.
             market_pair_to_active_orders = defaultdict(list)
 
-            for maker_market, limit_order in active_maker_orders:
+            for maker_market, limit_order in active_limit_orders:
                 market_pair = self._market_pairs.get((maker_market, limit_order.trading_pair))
                 if market_pair is None:
                     self.log_with_clock(logging.WARNING,
@@ -295,7 +298,8 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                                         f"does not correspond to any whitelisted trading pairs. Skipping.")
                     continue
 
-                if not self._sb_order_tracker.c_has_in_flight_cancel(limit_order.client_order_id):
+                if not self._sb_order_tracker.c_has_in_flight_cancel(limit_order.client_order_id) and \
+                        limit_order.client_order_id in self._maker_order_ids:
                     market_pair_to_active_orders[market_pair].append(limit_order)
 
             # Process each market pair independently.
@@ -303,6 +307,17 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                 self.c_process_market_pair(market_pair, market_pair_to_active_orders[market_pair])
         finally:
             self._last_timestamp = timestamp
+
+    def has_active_taker_order(self, object market_pair):
+        cdef dict market_orders = self._sb_order_tracker.c_get_market_orders()
+        if len(market_orders.get(market_pair, {})) > 0:
+            return True
+        cdef dict limit_orders = self._sb_order_tracker.c_get_limit_orders()
+        limit_orders = limit_orders.get(market_pair, {})
+        if len(limit_orders) > 0:
+            if len(set(limit_orders.keys()).intersection(set(self._maker_order_ids))) > 0:
+                return True
+        return False
 
     cdef c_process_market_pair(self, object market_pair, list active_orders):
         """
@@ -326,13 +341,12 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         """
         cdef:
             object current_hedging_price
-            MarketBase taker_market
+            ExchangeBase taker_market
             bint is_buy
             bint has_active_bid = False
             bint has_active_ask = False
             bint need_adjust_order = False
             double anti_hysteresis_timer = self._anti_hysteresis_timers.get(market_pair, 0)
-            dict tracked_taker_orders = self._sb_order_tracker.c_get_taker_orders()
 
         global s_decimal_zero
 
@@ -383,7 +397,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             return
 
         # If there are pending market orders, wait for them to complete
-        if len(tracked_taker_orders.get(market_pair, {})) > 0:
+        if self.has_active_taker_order(market_pair):
             return
 
         # See if it's profitable to place a limit order on maker market.
@@ -397,10 +411,11 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         cdef:
             str order_id = order_filled_event.order_id
             object market_pair = self._market_pair_tracker.c_get_market_pair_from_order_id(order_id)
+            object exchange = self._market_pair_tracker.c_get_exchange_from_order_id(order_id)
             tuple order_fill_record
 
         # Make sure to only hedge limit orders.
-        if market_pair is not None and order_filled_event.order_type is OrderType.LIMIT:
+        if market_pair is not None and order_id in self._maker_order_ids:
             limit_order_record = self._sb_order_tracker.c_get_shadow_limit_order(order_id)
             order_fill_record = (limit_order_record, order_filled_event)
 
@@ -446,11 +461,12 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         cdef:
             str order_id = order_completed_event.order_id
             object market_pair = self._market_pair_tracker.c_get_market_pair_from_order_id(order_id)
+            object exchange = self._market_pair_tracker.c_get_exchange_from_order_id(order_id)
             LimitOrder limit_order_record
             object order_type = order_completed_event.order_type
 
         if market_pair is not None:
-            if order_type == OrderType.LIMIT:
+            if order_id in self._maker_order_ids:
                 limit_order_record = self._sb_order_tracker.c_get_limit_order(market_pair.maker, order_id)
                 self.log_with_clock(
                     logging.INFO,
@@ -458,14 +474,19 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) has been completely filled."
                 )
-            if order_type == OrderType.MARKET:
-                market_order_record = self._sb_order_tracker.c_get_market_order(market_pair.taker, order_id)
-                if market_order_record is not None:
-                    self.log_with_clock(
-                        logging.INFO,
-                        f"({market_pair.taker.trading_pair}) Taker buy order {order_id} for "
-                        f"({market_order_record.amount} {market_order_record.base_asset} has been completely filled."
-                    )
+                self.notify_hb_app(
+                    f"Maker BUY order ({limit_order_record.quantity} {limit_order_record.base_currency} @ "
+                    f"{limit_order_record.price} {limit_order_record.quote_currency}) is filled."
+                )
+            else:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"({market_pair.taker.trading_pair}) Taker buy order {order_id} for "
+                    f"({order_completed_event.base_asset_amount} {order_completed_event.base_asset} has been completely filled."
+                )
+                self.notify_hb_app(
+                    f"Taker buy order {order_completed_event.base_asset_amount} {order_completed_event.base_asset} is filled."
+                )
 
     cdef c_did_complete_sell_order(self, object order_completed_event):
         """
@@ -475,11 +496,12 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         cdef:
             str order_id = order_completed_event.order_id
             object market_pair = self._market_pair_tracker.c_get_market_pair_from_order_id(order_id)
+            object exchange = self._market_pair_tracker.c_get_exchange_from_order_id(order_id)
             LimitOrder limit_order_record
 
         order_type = order_completed_event.order_type
         if market_pair is not None:
-            if order_type == OrderType.LIMIT:
+            if order_id in self._maker_order_ids:
                 limit_order_record = self._sb_order_tracker.c_get_limit_order(market_pair.maker, order_id)
                 self.log_with_clock(
                     logging.INFO,
@@ -487,14 +509,19 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) has been completely filled."
                 )
-            if order_type == OrderType.MARKET:
-                market_order_record = self._sb_order_tracker.c_get_market_order(market_pair.taker, order_id)
-                if market_order_record is not None:
-                    self.log_with_clock(
-                        logging.INFO,
-                        f"({market_pair.taker.trading_pair}) Taker sell order {order_id} for "
-                        f"({market_order_record.amount} {market_order_record.base_asset} has been completely filled."
-                    )
+                self.notify_hb_app(
+                    f"Maker sell order ({limit_order_record.quantity} {limit_order_record.base_currency} @ "
+                    f"{limit_order_record.price} {limit_order_record.quote_currency}) is filled."
+                )
+            else:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"({market_pair.taker.trading_pair}) Taker sell order {order_id} for "
+                    f"({order_completed_event.base_asset_amount} {order_completed_event.base_asset} has been completely filled."
+                )
+                self.notify_hb_app(
+                    f"Taker sell order {order_completed_event.base_asset_amount} {order_completed_event.base_asset} is filled."
+                )
 
     cdef bint c_check_if_price_has_drifted(self, object market_pair, LimitOrder active_order):
         """
@@ -557,7 +584,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         :param market_pair: cross exchange market pair
         """
         cdef:
-            MarketBase taker_market = market_pair.taker.market
+            ExchangeBase taker_market = market_pair.taker.market
             str taker_trading_pair = market_pair.taker.trading_pair
             OrderBook taker_order_book = market_pair.taker.order_book
             list buy_fill_records = self._order_fill_buy_events.get(market_pair, [])
@@ -580,9 +607,11 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             taker_top = taker_market.c_get_price(taker_trading_pair, False)
             avg_fill_price = (sum([r.price * r.amount for _, r in buy_fill_records]) /
                               sum([r.amount for _, r in buy_fill_records]))
+            order_price = taker_market.get_price_for_volume(taker_trading_pair, False,
+                                                            quantized_hedge_amount).result_price
 
             if quantized_hedge_amount > s_decimal_zero:
-                self.c_sell_with_specific_market(market_pair, quantized_hedge_amount)
+                self.c_place_order(market_pair, False, False, quantized_hedge_amount, order_price)
 
                 del self._order_fill_buy_events[market_pair]
                 if self._logging_options & self.OPTION_LOG_MAKER_ORDER_HEDGED:
@@ -611,9 +640,11 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             taker_top = taker_market.c_get_price(taker_trading_pair, True)
             avg_fill_price = (sum([r.price * r.amount for _, r in sell_fill_records]) /
                               sum([r.amount for _, r in sell_fill_records]))
+            order_price = taker_market.get_price_for_volume(taker_trading_pair, True,
+                                                            quantized_hedge_amount).result_price
 
             if quantized_hedge_amount > s_decimal_zero:
-                self.c_buy_with_specific_market(market_pair, quantized_hedge_amount)
+                self.c_place_order(market_pair, True, False, quantized_hedge_amount, order_price)
 
                 del self._order_fill_sell_events[market_pair]
                 if self._logging_options & self.OPTION_LOG_MAKER_ORDER_HEDGED:
@@ -644,7 +675,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         :rtype: Decimal
         """
         cdef:
-            MarketBase maker_market = market_pair.maker.market
+            ExchangeBase maker_market = market_pair.maker.market
             str trading_pair = market_pair.maker.trading_pair
         if self._order_amount and self._order_amount > 0:
             base_order_size = self._order_amount
@@ -664,7 +695,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         :rtype: Decimal
         """
         cdef:
-            MarketBase maker_market = market_pair.maker.market
+            ExchangeBase maker_market = market_pair.maker.market
             str trading_pair = market_pair.maker.trading_pair
             object base_balance = maker_market.c_get_balance(market_pair.maker.base_asset)
             object quote_balance = maker_market.c_get_balance(market_pair.maker.quote_asset)
@@ -692,8 +723,8 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         """
         cdef:
             str taker_trading_pair = market_pair.taker.trading_pair
-            MarketBase maker_market = market_pair.maker.market
-            MarketBase taker_market = market_pair.taker.market
+            ExchangeBase maker_market = market_pair.maker.market
+            ExchangeBase taker_market = market_pair.taker.market
 
         if is_bid:
 
@@ -752,8 +783,8 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         """
         cdef:
             str taker_trading_pair = market_pair.taker.trading_pair
-            MarketBase maker_market = market_pair.maker.market
-            MarketBase taker_market = market_pair.taker.market
+            ExchangeBase maker_market = market_pair.maker.market
+            ExchangeBase taker_market = market_pair.taker.market
             OrderBook taker_order_book = market_pair.taker.order_book
             OrderBook maker_order_book = market_pair.maker.order_book
             object top_bid_price = s_decimal_nan
@@ -778,9 +809,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
 
             # If quote assets are not same, convert them from taker's quote asset to maker's quote asset
             if market_pair.maker.quote_asset != market_pair.taker.quote_asset:
-                taker_price *= self._exchange_rate_conversion.convert_token_value_decimal(1,
-                                                                                          market_pair.taker.quote_asset,
-                                                                                          market_pair.maker.quote_asset)
+                taker_price *= self.market_conversion_rate()
 
             # you are buying on the maker market and selling on the taker market
             maker_price = taker_price / (1 + self._min_profitability)
@@ -815,9 +844,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                 return s_decimal_nan
 
             if market_pair.maker.quote_asset != market_pair.taker.quote_asset:
-                taker_price *= self._exchange_rate_conversion.convert_token_value_decimal(1,
-                                                                                          market_pair.taker.quote_asset,
-                                                                                          market_pair.maker.quote_asset)
+                taker_price *= self.market_conversion_rate()
 
             # You are buying on the taker market and selling on the maker market
             maker_price = taker_price * (1 + self._min_profitability)
@@ -861,7 +888,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         """
         cdef:
             str taker_trading_pair = market_pair.taker.trading_pair
-            MarketBase taker_market = market_pair.taker.market
+            ExchangeBase taker_market = market_pair.taker.market
         # Calculate the next price from the top, and the order size limit.
         if is_bid:
             try:
@@ -871,9 +898,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
 
             # If quote assets are not same, convert them from taker's quote asset to maker's quote asset
             if market_pair.maker.quote_asset != market_pair.taker.quote_asset:
-                taker_price *= self._exchange_rate_conversion.convert_token_value_decimal(1,
-                                                                                          market_pair.taker.quote_asset,
-                                                                                          market_pair.maker.quote_asset)
+                taker_price *= self.market_conversion_rate()
 
             return taker_price
         else:
@@ -883,9 +908,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                 return None
 
             if market_pair.maker.quote_asset != market_pair.taker.quote_asset:
-                taker_price *= self._exchange_rate_conversion.convert_token_value_decimal(1,
-                                                                                          market_pair.taker.quote_asset,
-                                                                                          market_pair.maker.quote_asset)
+                taker_price *= self.market_conversion_rate()
 
             return taker_price
 
@@ -909,7 +932,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         """
         cdef:
             str trading_pair = market_pair.maker.trading_pair
-            MarketBase maker_market = market_pair.maker.market
+            ExchangeBase maker_market = market_pair.maker.market
 
         if self._top_depth_tolerance == 0:
             top_bid_price = maker_market.c_get_price(trading_pair, False)
@@ -1045,8 +1068,8 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         cdef:
             bint is_buy = active_order.is_buy
             object order_price = active_order.price
-            MarketBase maker_market = market_pair.maker.market
-            MarketBase taker_market = market_pair.taker.market
+            ExchangeBase maker_market = market_pair.maker.market
+            ExchangeBase taker_market = market_pair.taker.market
 
             object quote_asset_amount = maker_market.c_get_balance(market_pair.maker.quote_asset) if is_buy else \
                 taker_market.c_get_balance(market_pair.taker.quote_asset)
@@ -1068,6 +1091,12 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             self.c_cancel_order(market_pair, active_order.client_order_id)
             return False
         return True
+
+    def market_conversion_rate(self) -> Decimal:
+        """
+        Return price conversion rate for a taker market (to convert it into maker base asset value)
+        """
+        return self._taker_to_maker_quote_conversion_rate / self._taker_to_maker_base_conversion_rate
 
     cdef c_check_and_create_new_orders(self, object market_pair, bint has_active_bid, bint has_active_ask):
         """
@@ -1097,9 +1126,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                         True,
                         bid_size
                     )
-                    effective_hedging_price_adjusted = self._exchange_rate_conversion.adjust_token_rate(
-                        market_pair.taker.quote_asset, effective_hedging_price
-                    )
+                    effective_hedging_price_adjusted = effective_hedging_price * self.market_conversion_rate()
                     if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                         self.log_with_clock(
                             logging.INFO,
@@ -1109,12 +1136,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                             f"Current hedging price: {effective_hedging_price} {market_pair.taker.quote_asset} "
                             f"(Rate adjusted: {effective_hedging_price_adjusted:.2f} {market_pair.taker.quote_asset})."
                         )
-                    self.c_buy_with_specific_market(
-                        market_pair,
-                        bid_size,
-                        order_type=OrderType.LIMIT,
-                        price=bid_price
-                    )
+                    order_id = self.c_place_order(market_pair, True, True, bid_size, bid_price)
                 else:
                     if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
                         self.log_with_clock(
@@ -1143,9 +1165,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                         False,
                         ask_size
                     )
-                    effective_hedging_price_adjusted = self._exchange_rate_conversion.adjust_token_rate(
-                        market_pair.maker.quote_asset, effective_hedging_price
-                    )
+                    effective_hedging_price_adjusted = effective_hedging_price
                     if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
                         self.log_with_clock(
                             logging.INFO,
@@ -1155,12 +1175,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                             f"Current hedging price: {effective_hedging_price} {market_pair.maker.quote_asset} "
                             f"(Rate adjusted: {effective_hedging_price_adjusted:.2f} {market_pair.maker.quote_asset})."
                         )
-                    self.c_sell_with_specific_market(
-                        market_pair,
-                        ask_size,
-                        order_type=OrderType.LIMIT,
-                        price=ask_price
-                    )
+                    order_id = self.c_place_order(market_pair, False, True, ask_size, ask_price)
                 else:
                     if self._logging_options & self.OPTION_LOG_NULL_ORDER_SIZE:
                         self.log_with_clock(
@@ -1177,48 +1192,34 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                         f"ask size is 0. Skipping. Check available balance."
                     )
 
-    # <editor-fold desc="+ Creating and canceling orders">
-    # Override the default buy, sell and cancel functions to allow the use of XEMM market pair, and the correct
-    # attribution of trades to XEMM market pairs.
-    # ----------------------------------------------------------------------------------------------------------
-    cdef str c_buy_with_specific_market(self, object market_pair, object amount,
-                                        object order_type=OrderType.MARKET,
-                                        object price=s_decimal_nan,
-                                        double expiration_seconds=NaN):
-        if not isinstance(market_pair, CrossExchangeMarketPair):
-            raise TypeError("market_pair must be a CrossExchangeMarketPair.")
-
-        market_trading_pair_tuple = market_pair.maker if order_type is OrderType.LIMIT else market_pair.taker
-
+    cdef str c_place_order(self,
+                           object market_pair,
+                           bint is_buy,
+                           bint is_maker,  # True for maker order, False for taker order
+                           object amount,
+                           object price):
+        cdef:
+            str order_id
+            double expiration_seconds = NaN
+            object market_info = market_pair.maker if is_maker else market_pair.taker
+            object order_type = market_info.market.get_maker_order_type() if is_maker else \
+                market_info.market.get_taker_order_type()
+        if order_type is OrderType.MARKET:
+            price = s_decimal_nan
         if not self._active_order_canceling:
             expiration_seconds = self._limit_order_min_expiration
-
-        cdef:
-            str order_id = StrategyBase.c_buy_with_specific_market(self, market_trading_pair_tuple, amount,
-                                                                   order_type=order_type, price=price,
-                                                                   expiration_seconds=expiration_seconds)
+        if is_buy:
+            order_id = StrategyBase.c_buy_with_specific_market(self, market_info, amount,
+                                                               order_type=order_type, price=price,
+                                                               expiration_seconds=expiration_seconds)
+        else:
+            order_id = StrategyBase.c_sell_with_specific_market(self, market_info, amount,
+                                                                order_type=order_type, price=price,
+                                                                expiration_seconds=expiration_seconds)
         self._sb_order_tracker.c_add_create_order_pending(order_id)
-        self._market_pair_tracker.c_start_tracking_order_id(order_id, market_pair)
-        return order_id
-
-    cdef str c_sell_with_specific_market(self, object market_pair, object amount,
-                                         object order_type=OrderType.MARKET,
-                                         object price=s_decimal_nan,
-                                         double expiration_seconds=NaN):
-        if not isinstance(market_pair, CrossExchangeMarketPair):
-            raise TypeError("market_pair must be a CrossExchangeMarketPair.")
-
-        market_trading_pair_tuple = market_pair.maker if order_type is OrderType.LIMIT else market_pair.taker
-
-        if not self._active_order_canceling:
-            expiration_seconds = self._limit_order_min_expiration
-
-        cdef:
-            str order_id = StrategyBase.c_sell_with_specific_market(self, market_trading_pair_tuple, amount,
-                                                                    order_type=order_type, price=price,
-                                                                    expiration_seconds=expiration_seconds)
-        self._sb_order_tracker.c_add_create_order_pending(order_id)
-        self._market_pair_tracker.c_start_tracking_order_id(order_id, market_pair)
+        self._market_pair_tracker.c_start_tracking_order_id(order_id, market_info.market, market_pair)
+        if is_maker:
+            self._maker_order_ids.append(order_id)
         return order_id
 
     cdef c_cancel_order(self, object market_pair, str order_id):
@@ -1248,3 +1249,8 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
     cdef c_did_create_sell_order(self, object order_created_event):
         order_id = order_created_event.order_id
         self._sb_order_tracker.c_remove_create_order_pending(order_id)
+
+    def notify_hb_app(self, msg: str):
+        if self._hb_app_notification:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            HummingbotApplication.main_application()._notify(msg)

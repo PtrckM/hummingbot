@@ -1,11 +1,12 @@
 import logging
 from decimal import Decimal
 import ruamel.yaml
-from os import unlink
+from os import (
+    unlink
+)
 from os.path import (
     join,
-    isfile,
-    exists
+    isfile
 )
 from collections import OrderedDict
 import json
@@ -30,10 +31,12 @@ from hummingbot.client.settings import (
     CONF_POSTFIX,
     CONF_PREFIX,
     TOKEN_ADDRESSES_FILE_PATH,
+    CONNECTOR_SETTINGS
 )
 from hummingbot.client.config.security import Security
-from hummingbot.core.utils.exchange_rate_conversion import ExchangeRateConversion
+from hummingbot.core.utils.market_price import get_mid_price
 from hummingbot import get_strategy_list
+from eth_account import Account
 
 # Use ruamel.yaml to preserve order and comments in .yml file
 yaml_parser = ruamel.yaml.YAML()
@@ -62,9 +65,10 @@ def parse_cvar_value(cvar: ConfigVar, value: Any) -> Any:
     elif cvar.type == 'json':
         if isinstance(value, str):
             value_json = value.replace("'", '"')  # replace single quotes with double quotes for valid JSON
-            return json.loads(value_json)
+            cvar_value = json.loads(value_json)
         else:
-            return value
+            cvar_value = value
+        return cvar_json_migration(cvar, cvar_value)
     elif cvar.type == 'float':
         try:
             return float(value)
@@ -92,6 +96,19 @@ def parse_cvar_value(cvar: ConfigVar, value: Any) -> Any:
             return value
     else:
         raise TypeError
+
+
+def cvar_json_migration(cvar: ConfigVar, cvar_value: Any) -> Any:
+    """
+    A special function to migrate json config variable when its json type changes, for paper_trade_account_balance
+    and min_quote_order_amount, they were List but change to Dict.
+    """
+    if cvar.key in ("paper_trade_account_balance", "min_quote_order_amount") and isinstance(cvar_value, List):
+        results = {}
+        for item in cvar_value:
+            results[item[0]] = item[1]
+        return results
+    return cvar_value
 
 
 def parse_cvar_default_value_prompt(cvar: ConfigVar) -> str:
@@ -137,16 +154,29 @@ def get_strategy_template_path(strategy: str) -> str:
     return join(TEMPLATE_PATH, f"{CONF_PREFIX}{strategy}{CONF_POSTFIX}_TEMPLATE.yml")
 
 
-def get_erc20_token_addresses(trading_pairs: List[str]):
+def get_eth_wallet_private_key() -> Optional[str]:
+    ethereum_wallet = global_config_map.get("ethereum_wallet").value
+    if ethereum_wallet is None or ethereum_wallet == "":
+        return None
+    private_key = Security._private_keys[ethereum_wallet]
+    account = Account.privateKeyToAccount(private_key)
+    return account.privateKey.hex()
 
-    with open(TOKEN_ADDRESSES_FILE_PATH) as f:
+
+def get_erc20_token_addresses(tokens: List[str]) -> Dict[str, str]:
+    chain = global_config_map.get("ethereum_chain_name").value
+    address_file_path = TOKEN_ADDRESSES_FILE_PATH
+    if chain is not None and chain.lower() == "kovan":
+        address_file_path = TOKEN_ADDRESSES_FILE_PATH.replace(".json", f"_{chain.lower()}.json")
+    with open(address_file_path) as f:
         try:
             data: Dict[str, str] = json.load(f)
             overrides: Dict[str, str] = global_config_map.get("ethereum_token_overrides").value
             if overrides is not None:
                 data.update(overrides)
-            addresses = [data[trading_pair] for trading_pair in trading_pairs if trading_pair in data]
-            return addresses
+            # addresses = [data[trading_pair] for trading_pair in tokens if trading_pair in data]
+            # return addresses
+            return {k: v for k, v in data.items() if k in tokens}
         except Exception as e:
             logging.getLogger().error(e, exc_info=True)
 
@@ -159,6 +189,13 @@ def _merge_dicts(*args: Dict[str, ConfigVar]) -> OrderedDict:
     for d in args:
         result.update(d)
     return result
+
+
+def get_connector_class(connector_name: str) -> Callable:
+    conn_setting = CONNECTOR_SETTINGS[connector_name]
+    mod = __import__(conn_setting.module_path(),
+                     fromlist=[conn_setting.class_name()])
+    return getattr(mod, conn_setting.class_name())
 
 
 def get_strategy_config_map(strategy: str) -> Optional[Dict[str, ConfigVar]]:
@@ -204,13 +241,13 @@ def strategy_name_from_file(file_path: str) -> str:
 
 
 def validate_strategy_file(file_path: str) -> Optional[str]:
-    if not exists(file_path):
+    if not isfile(file_path):
         return f"{file_path} file does not exist."
     strategy = strategy_name_from_file(file_path)
     if strategy is None:
-        return f"Invalid configuration file or 'strategy' field is missing."
+        return "Invalid configuration file or 'strategy' field is missing."
     if strategy not in get_strategy_list():
-        return f"Invalid strategy specified in the file."
+        return "Invalid strategy specified in the file."
     return None
 
 
@@ -348,25 +385,22 @@ async def create_yml_files():
                     shutil.copy(template_path, conf_path)
 
 
-def default_min_quote(quote_asset):
-    global_quote_amount = []
-    if global_config_map["min_quote_order_amount"].value is not None:
-        global_quote_amount = [[b, m] for b, m in global_config_map["min_quote_order_amount"].value if b == quote_asset]
-    default_quote_asset, default_amount = "USD", 11
-    if len(global_quote_amount) > 0:
-        default_quote_asset, default_amount = global_quote_amount[0]
-    return default_quote_asset, default_amount
+def default_min_quote(quote_asset: str) -> (str, Decimal):
+    result_quote, result_amount = "USD", Decimal("11")
+    min_quote_config = global_config_map["min_quote_order_amount"].value
+    if min_quote_config is not None and quote_asset in min_quote_config:
+        result_quote, result_amount = quote_asset, Decimal(str(min_quote_config[quote_asset]))
+    return result_quote, result_amount
 
 
-def minimum_order_amount(trading_pair):
-    try:
-        base_asset, quote_asset = trading_pair.split("-")
-        default_quote_asset, default_amount = default_min_quote(quote_asset)
-        quote_amount = ExchangeRateConversion.get_instance().convert_token_value_decimal(default_amount,
-                                                                                         default_quote_asset,
-                                                                                         base_asset)
-    except Exception:
-        quote_amount = Decimal('0')
+def minimum_order_amount(exchange: str, trading_pair: str) -> Decimal:
+    base_asset, quote_asset = trading_pair.split("-")
+    default_quote_asset, default_amount = default_min_quote(quote_asset)
+    quote_amount = Decimal("0")
+    if default_quote_asset == quote_asset:
+        mid_price = get_mid_price(exchange, trading_pair)
+        if mid_price is not None:
+            quote_amount = default_amount / mid_price
     return round(quote_amount, 4)
 
 
@@ -443,3 +477,16 @@ def parse_config_default_to_text(config: ConfigVar) -> str:
     if isinstance(default, Decimal):
         default = "{0:.4f}".format(default)
     return default
+
+
+def secondary_market_conversion_rate(strategy) -> Decimal:
+    config_map = get_strategy_config_map(strategy)
+    if "secondary_to_primary_quote_conversion_rate" in config_map:
+        base_rate = config_map["secondary_to_primary_base_conversion_rate"].value
+        quote_rate = config_map["secondary_to_primary_quote_conversion_rate"].value
+    elif "taker_to_maker_quote_conversion_rate" in config_map:
+        base_rate = config_map["taker_to_maker_base_conversion_rate"].value
+        quote_rate = config_map["taker_to_maker_quote_conversion_rate"].value
+    else:
+        return Decimal("1")
+    return quote_rate / base_rate
